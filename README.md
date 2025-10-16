@@ -1,0 +1,2 @@
+# Supportrr
+Discord Support Bot
