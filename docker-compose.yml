@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: discord-support-bot
+    restart: unless-stopped
+    environment:
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - MANAGED_CHANNEL_ID=${MANAGED_CHANNEL_ID}
+      - EXEMPT_ROLE_IDS=${EXEMPT_ROLE_IDS}
+      - LOGGING_CHANNEL_ID=${LOGGING_CHANNEL_ID}
+      - DATABASE_PATH=/app/data/bot.db
+    volumes:
+      # Persist database across container restarts
+      - ./data:/app/data
+    env_file:
+      - .env

@@ -1,0 +1,36 @@
+# Node modules
+node_modules/
+
+# Build output
+dist/
+
+# Git
+.git/
+.gitignore
+
+# Environment files
+.env
+
+# Documentation
+*.md
+plan.md
+
+# IDE
+.vscode/
+.idea/
+
+# Database files (will be in volume)
+*.db
+*.db-journal
+data/
+
+# TypeScript config (copied explicitly when needed)
+# tsconfig.json is needed in builder stage
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
