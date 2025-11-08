@@ -2,11 +2,11 @@
  * Message handler for managing support channel messages
  */
 
-import { Message } from 'discord.js';
+import { Message, PermissionsBitField } from 'discord.js';
 import { client } from '../bot.js';
 import { config } from '../config.js';
 import { getActiveThread, createThread, incrementAttempts } from '../database.js';
-import { isExemptUser } from '../utils/permissions.js';
+import { isExemptUser, canKickMembers } from '../utils/permissions.js';
 import {
   logThreadCreated,
   logMessageDeleted,
@@ -14,11 +14,39 @@ import {
   logError,
 } from '../utils/logger.js';
 
+// Track users who are currently having threads created (prevents race conditions)
+const threadCreationInProgress = new Map<string, Promise<void>>();
+
 /**
  * Initialize message event handler
  */
 export function initializeMessageHandler(): void {
   client.on('messageCreate', handleMessage);
+}
+
+/**
+ * Verify that a thread is still active (not archived or deleted)
+ * @param threadId - Discord thread ID
+ * @returns true if thread exists and is not archived, false otherwise
+ */
+async function verifyThreadIsActive(threadId: string): Promise<boolean> {
+  try {
+    const thread = await client.channels.fetch(threadId);
+    if (!thread || !thread.isThread()) {
+      return false; // Thread doesn't exist or is not a thread
+    }
+
+    // Check if thread is archived or locked
+    if (thread.archived || thread.locked) {
+      return false;
+    }
+
+    return true;
+  } catch (error) {
+    // If we can't fetch the thread, assume it's not active
+    console.log(`Could not verify thread ${threadId}: ${error}`);
+    return false;
+  }
 }
 
 /**
@@ -50,12 +78,40 @@ async function handleMessage(message: Message): Promise<void> {
       return;
     }
 
+    // Check if a thread is currently being created for this user
+    const inProgressPromise = threadCreationInProgress.get(message.author.id);
+    if (inProgressPromise) {
+      // Wait for the in-progress creation to complete
+      await inProgressPromise;
+    }
+
     // Check database for active thread
-    const activeThread = getActiveThread(message.author.id);
+    let activeThread = getActiveThread(message.author.id);
+
+    // If we found a thread in the database, verify it's actually active in Discord
+    if (activeThread) {
+      const isThreadStillActive = await verifyThreadIsActive(activeThread.thread_id);
+      if (!isThreadStillActive) {
+        // Thread is archived or deleted, mark as inactive in database
+        console.log(`Thread ${activeThread.thread_id} is archived/deleted, marking as inactive`);
+        const { deactivateThread } = await import('../database.js');
+        deactivateThread(activeThread.thread_id);
+        activeThread = null; // Treat as if there's no active thread
+      }
+    }
 
     if (!activeThread) {
       // No active thread - create a new one
-      await createNewThread(message);
+      // Store the promise to prevent concurrent creations
+      const creationPromise = createNewThread(message);
+      threadCreationInProgress.set(message.author.id, creationPromise);
+
+      try {
+        await creationPromise;
+      } finally {
+        // Always remove from the map when done
+        threadCreationInProgress.delete(message.author.id);
+      }
     } else {
       // Active thread exists - delete message and notify user
       await handleExistingThread(message, activeThread.thread_id);
@@ -71,19 +127,31 @@ async function handleMessage(message: Message): Promise<void> {
  * @param message - Original message from user
  */
 async function createNewThread(message: Message): Promise<void> {
+  let thread;
   try {
     const userName = message.member?.displayName || message.author.username;
     const threadName = `${userName}'s Support Thread`;
 
     // Create the thread
-    const thread = await message.startThread({
+    thread = await message.startThread({
       name: threadName,
       autoArchiveDuration: 1440, // 24 hours in minutes
       reason: 'New support request',
     });
 
-    // Store in database
-    createThread(message.author.id, thread.id, message.channelId);
+    // Store in database - if this fails, we need to clean up the Discord thread
+    try {
+      createThread(message.author.id, thread.id, message.channelId);
+    } catch (dbError) {
+      console.error('Failed to store thread in database, cleaning up Discord thread:', dbError);
+      // Attempt to delete the thread we just created
+      try {
+        await thread.delete('Database insertion failed');
+      } catch (deleteError) {
+        console.error('Failed to delete thread during cleanup:', deleteError);
+      }
+      throw dbError; // Re-throw to be caught by outer catch
+    }
 
     // Log thread creation
     await logThreadCreated(
@@ -97,6 +165,14 @@ async function createNewThread(message: Message): Promise<void> {
   } catch (error) {
     console.error('Error creating thread:', error);
     await logError(error as Error, 'createNewThread');
+    // If we have a thread object and it still exists, try to notify the user
+    if (thread) {
+      try {
+        await thread.send('⚠️ An error occurred while setting up this thread. Please contact a moderator.');
+      } catch (notifyError) {
+        console.error('Failed to notify user of thread creation error:', notifyError);
+      }
+    }
   }
 }
 
@@ -108,6 +184,20 @@ async function createNewThread(message: Message): Promise<void> {
 async function handleExistingThread(message: Message, threadId: string): Promise<void> {
   try {
     const userName = message.member?.displayName || message.author.username;
+
+    // Check if bot can delete messages
+    const channel = message.channel;
+    if (channel.isTextBased() && 'guild' in channel && channel.guild) {
+      const botMember = channel.guild.members.me;
+      if (botMember && channel.permissionsFor) {
+        const permissions = channel.permissionsFor(botMember);
+        if (!permissions?.has(PermissionsBitField.Flags.ManageMessages)) {
+          console.error(`Cannot delete message: Missing MANAGE_MESSAGES permission in channel ${channel.id}`);
+          await logError(new Error('Missing MANAGE_MESSAGES permission'), 'handleExistingThread');
+          return;
+        }
+      }
+    }
 
     // Delete the message
     await message.delete();
@@ -131,8 +221,8 @@ async function handleExistingThread(message: Message, threadId: string): Promise
       newAttemptCount
     );
 
-    // Check if user should be kicked (10 or more attempts)
-    if (newAttemptCount >= 10) {
+    // Check if user should be kicked (more than 10 attempts = 11th attempt)
+    if (newAttemptCount > 10) {
       await kickUser(message);
     }
 
@@ -161,10 +251,10 @@ async function sendThreadLinkDM(
   try {
     const user = await client.users.fetch(userId);
 
-    const warningMessage = attemptCount >= 10
-      ? '\n\n⚠️ **WARNING:** You have reached the maximum number of attempts. You will be kicked from the server.'
+    const warningMessage = attemptCount > 10
+      ? '\n\n⚠️ **WARNING:** You have exceeded the maximum number of attempts and will be kicked from the server.'
       : attemptCount >= 7
-      ? `\n\n⚠️ **WARNING:** You have ${10 - attemptCount} attempts remaining before being kicked.`
+      ? `\n\n⚠️ **WARNING:** You have ${10 - attemptCount} attempt(s) remaining before being kicked.`
       : '';
 
     await user.send(
@@ -191,14 +281,25 @@ async function kickUser(message: Message): Promise<void> {
       return;
     }
 
+    // Check if bot has permission to kick members
+    if (message.guild && !canKickMembers(message.guild)) {
+      console.error('Cannot kick user: Missing KICK_MEMBERS permission');
+      await logError(new Error('Missing KICK_MEMBERS permission'), 'kickUser');
+      return;
+    }
+
     const userName = message.member.displayName || message.author.username;
 
-    await message.member.kick('Exceeded maximum posting attempts in support channel (10 attempts)');
+    await message.member.kick('Exceeded maximum posting attempts in support channel (more than 10 attempts)');
+
+    // Get the final attempt count for logging
+    const thread = getActiveThread(message.author.id);
+    const attemptCount = thread?.attempt_count || 0;
 
     await logUserKicked(
       message.author.id,
       userName,
-      10
+      attemptCount
     );
 
     console.log(`Kicked user ${userName} (${message.author.id}) for excessive posting attempts`);

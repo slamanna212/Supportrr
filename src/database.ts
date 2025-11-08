@@ -5,6 +5,8 @@
 
 import Database from 'better-sqlite3';
 import { config } from './config.js';
+import * as fs from 'fs';
+import * as path from 'path';
 
 export interface UserThread {
   id: number;
@@ -23,7 +25,14 @@ let db: Database.Database;
  * Initialize the database and create tables if they don't exist
  */
 export function initializeDatabase(): void {
-  db = new Database(config.databasePath, { verbose: console.log });
+  // Ensure the database directory exists
+  const dbDir = path.dirname(config.databasePath);
+  if (!fs.existsSync(dbDir)) {
+    fs.mkdirSync(dbDir, { recursive: true });
+    console.log(`Created database directory: ${dbDir}`);
+  }
+
+  db = new Database(config.databasePath);
 
   // Create the user_threads table
   const createTableSQL = `
@@ -46,6 +55,8 @@ export function initializeDatabase(): void {
   db.exec('CREATE INDEX IF NOT EXISTS idx_thread_id ON user_threads(thread_id)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_is_active ON user_threads(is_active)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_expires_at ON user_threads(expires_at)');
+  // Compound index for the common query pattern (user_id + is_active)
+  db.exec('CREATE INDEX IF NOT EXISTS idx_user_active ON user_threads(user_id, is_active)');
 
   console.log('Database initialized successfully');
 }
@@ -93,17 +104,26 @@ export function createThread(userId: string, threadId: string, channelId: string
  * @returns New attempt count
  */
 export function incrementAttempts(userId: string): number {
-  const stmt = db.prepare(`
-    UPDATE user_threads
-    SET attempt_count = attempt_count + 1
-    WHERE user_id = ? AND is_active = 1
-  `);
+  // Use a transaction to make this atomic
+  const transaction = db.transaction((userId: string) => {
+    const updateStmt = db.prepare(`
+      UPDATE user_threads
+      SET attempt_count = attempt_count + 1
+      WHERE user_id = ? AND is_active = 1
+    `);
+    updateStmt.run(userId);
 
-  stmt.run(userId);
+    const selectStmt = db.prepare(`
+      SELECT attempt_count FROM user_threads
+      WHERE user_id = ? AND is_active = 1
+      ORDER BY created_at DESC
+      LIMIT 1
+    `);
+    const result = selectStmt.get(userId) as { attempt_count: number } | undefined;
+    return result?.attempt_count || 0;
+  });
 
-  // Return the new attempt count
-  const thread = getActiveThread(userId);
-  return thread?.attempt_count || 0;
+  return transaction(userId);
 }
 
 /**

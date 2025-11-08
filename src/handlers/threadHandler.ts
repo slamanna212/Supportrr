@@ -94,11 +94,19 @@ async function cleanupExpiredThreads(): Promise<void> {
     for (const threadData of expiredThreads) {
       try {
         // Fetch the thread from Discord
-        const thread = await client.channels.fetch(threadData.thread_id);
+        const thread = await client.channels.fetch(threadData.thread_id).catch((error: any) => {
+          // Check if it's a 404 error (thread not found)
+          if (error.code === 10003 || error.status === 404) {
+            console.log(`Thread ${threadData.thread_id} not found (deleted)`);
+            return null;
+          }
+          // For other errors (network issues, etc.), re-throw to be handled by outer try-catch
+          throw error;
+        });
 
         if (!thread || !thread.isThread()) {
           console.log(`Thread ${threadData.thread_id} not found or is not a thread`);
-          // Mark as closed in database even if thread doesn't exist
+          // Mark as closed in database only if thread doesn't exist (404)
           closeThread(threadData.thread_id);
           continue;
         }
@@ -116,10 +124,19 @@ async function cleanupExpiredThreads(): Promise<void> {
         await logThreadExpired(threadData.thread_id, thread.name);
 
         console.log(`Closed expired thread: ${thread.name} (${thread.id})`);
-      } catch (error) {
+      } catch (error: any) {
         console.error(`Error closing thread ${threadData.thread_id}:`, error);
-        // Still mark as closed in database to prevent repeated attempts
-        closeThread(threadData.thread_id);
+
+        // Only mark as closed if it's a permanent error (not found, permissions, etc.)
+        // Don't mark as closed for transient errors (network issues, rate limits, etc.)
+        const permanentErrorCodes = [10003, 10004, 10008, 50001, 50013]; // Unknown Channel, Unknown Guild, Unknown Message, Missing Access, Missing Permissions
+        if (error.code && permanentErrorCodes.includes(error.code)) {
+          console.log(`Marking thread ${threadData.thread_id} as closed due to permanent error`);
+          closeThread(threadData.thread_id);
+        } else {
+          console.log(`Not marking thread ${threadData.thread_id} as closed - may be transient error, will retry later`);
+        }
+
         await logError(error as Error, `cleanupThread-${threadData.thread_id}`);
       }
     }
